@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Backend de Nuestra-MemorIA 🇨🇱
+Backend de CLIA 🇨🇱
 
 - RAGAnything + LightRAG con el mismo storage (mode="mix")
 - Reranker local: mixedbread-ai/mxbai-rerank-large-v2
@@ -42,14 +42,13 @@ TEXT_MODEL = "gpt-oss-20b"
 BASE_URL_TEXT = "http://localhost:8010/v1"
 API_KEY_TEXT = "none"
 
-STORAGE_PATH = os.environ.get("STORAGE_PATH", "/home/gperalta/multimodal_graph/rag_storage")
-RERANK_MODEL_PATH = os.environ.get("RERANK_MODEL_PATH", "/home/gperalta/models/mxbai-rerank-large-v2")
+STORAGE_PATH = os.environ.get("STORAGE_PATH", "path")
+RERANK_MODEL_PATH = os.environ.get("RERANK_MODEL_PATH", "path")
 
-ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "1").lower() in ("1", "true", "yes")
+ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "0").lower() in ("1", "true", "yes")
 
 DOCS_PATHS = [
-    "/home/gperalta/multimodal_graph/docs",
-    "/home/gperalta/multimodal_graph/docs_reparar",
+    "path",
 ]
 DOCS_MOUNTS = [f"/files/{i}" for i in range(len(DOCS_PATHS))]
 PDFJS_VIEWER = "https://mozilla.github.io/pdf.js/web/viewer.html"
@@ -58,7 +57,7 @@ rag_instance = None
 reranker_tokenizer = None
 reranker_model = None
 
-app = FastAPI(title="Nuestra-MemorIA Backend", version="3.2")
+app = FastAPI(title="CLIA Backend", version="3.2")
 
 # Monta documentos estáticos
 for base, mount in zip(DOCS_PATHS, DOCS_MOUNTS):
@@ -131,7 +130,7 @@ def ensure_reranker_loaded():
     print("✅ Reranker cargado (mxbai-rerank-large-v2)")
 
 
-def rerank_chunks(question: str, chunks: list[dict], top_k: int = 10) -> list[dict]:
+def rerank_chunks(question: str, chunks: list[dict], top_k: int = 100) -> list[dict]:
     if not chunks:
         return []
     if not ENABLE_RERANK:
@@ -158,9 +157,9 @@ async def get_rag():
         print("⚙️ Inicializando RAG-Anything…")
         cfg = RAGAnythingConfig(
             working_dir=STORAGE_PATH,
-            context_window=1,
+            context_window=100,
             context_mode="page",
-            max_context_tokens=2000,
+            max_context_tokens=32000,
             parse_method="auto",
         )
         rag_instance = RAGAnything(
@@ -257,7 +256,7 @@ async def query_text(question: str = Form(...)):
         relations = ctx.get("relations") or []
 
         visible = [c for c in raw_chunks if not is_private(c.get("source", ""))]
-        top_chunks = rerank_chunks(question, visible, 10)
+        top_chunks = rerank_chunks(question, visible, 200)
         enriched = enrich_chunks_for_ui(question, top_chunks)
         documents = sorted({Path(e["source_name"]).name for e in enriched if e["source_name"]})
 
@@ -339,7 +338,7 @@ async def download_file(mount_id: int, filename: str):
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Backend MemorIAnet activo en http://0.0.0.0:8083")
+    print("🚀 Backend CLIA activo en http://0.0.0.0:8083")
     if ENABLE_RERANK:
         try:
             ensure_reranker_loaded()

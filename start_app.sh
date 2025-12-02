@@ -22,11 +22,11 @@ HOME_DIR="$HOME"
 LOGDIR="$HOME_DIR/logs_memoria"
 mkdir -p "$LOGDIR"
 
-APP_BACKEND_DIR="$HOME_DIR/MemorIAnet/backend"
-APP_FRONTEND_DIR="$HOME_DIR/MemorIAnet/frontend"
+APP_BACKEND_DIR="$HOME_DIR/path"
+APP_FRONTEND_DIR="$HOME_DIR/path"
 
 # venv
-VENV_DIR="$HOME_DIR/multimodal_graph/multimodal_graph_env"
+VENV_DIR="$HOME_DIR/path"
 VENV_ACT="$VENV_DIR/bin/activate"
 if [ ! -f "$VENV_ACT" ]; then
   echo "❌ No existe el venv en: $VENV_ACT"
@@ -36,14 +36,13 @@ VENV_PY="$VENV_DIR/bin/python"
 
 # Model roots candidatos (ajusta/añade si hiciera falta)
 MODEL_ROOTS=(
-  "$HOME_DIR/models"
-  "$HOME_DIR/mi_entorno/carpeta_trabajo/models"
-  "/home/gperaltag/mi_entorno/carpeta_trabajo/models"
+  "$HOME_DIR/path"
+  "$HOME_DIR/path"
+  "path"
 )
 
 # Nombres esperados
 GPT20B_NAME="gpt-oss-20b"
-LLAVA_NAME="llava-1.5-7b-hf"
 
 # -----------------------------
 # 1) Entorno GPU + Offline HF
@@ -54,9 +53,19 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
+# 🔗 URLs backend (las heredan backend y frontend vía tmux)
+# - BACKEND_INTERNAL_URL: cómo el frontend (Streamlit en el servidor) llama al backend
+# - BACKEND_BROWSER_URL: cómo el navegador del usuario ve el backend (dominio público)
+# - BACKEND_URL: valor por defecto que usa app.py si no se definen las otras
+export BACKEND_INTERNAL_URL="http://localhost:8083"                             # Streamlit → backend
+export BACKEND_BROWSER_URL="https://grafo-nuestramemoria.pln.villena.cl"        # Navegador → backend
+export BACKEND_URL="$BACKEND_INTERNAL_URL"
+
 echo
 echo "🚀 Iniciando stack completo en GPU FÍSICA $GPU_ID…"
 echo "📂 Logs: $LOGDIR"
+echo "🌐 BACKEND_INTERNAL_URL = $BACKEND_INTERNAL_URL"
+echo "🌐 BACKEND_BROWSER_URL  = $BACKEND_BROWSER_URL"
 echo "----------------------------------------------------"
 
 # -----------------------------
@@ -107,11 +116,6 @@ GPT20B_DIR="$(pick_model_dir "$GPT20B_NAME" "${MODEL_ROOTS[@]}")" || {
   echo "   Crea un symlink o ajusta MODEL_ROOTS en este script."
   exit 1
 }
-LLAVA_DIR="$(pick_model_dir "$LLAVA_NAME" "${MODEL_ROOTS[@]}")" || {
-  echo "❌ No encuentro el modelo $LLAVA_NAME en: ${MODEL_ROOTS[*]}"
-  echo "   Crea un symlink o ajusta MODEL_ROOTS en este script."
-  exit 1
-}
 
 # -----------------------------
 # 4) Servicios (cada uno crea su propio script dentro de tmux)
@@ -123,13 +127,13 @@ launch_tmux_script () {
   local log="$2"
   local body="$3"   # contenido del script a ejecutar dentro de la sesión
 
-  # Construimos el contenido completo que se ejecutará dentro de tmux
-  # Usamos SOLO comillas dobles y escapamos $ como \$ dentro de body
   tmux new-session -d -s "$session" "bash -lc '
 set -e
 echo \"========== [$session] bootstrap ==========\" >> $log
 echo \"CWD before: \$(pwd)\" >> $log
 echo \"ENV CUDA_VISIBLE_DEVICES=\$CUDA_VISIBLE_DEVICES\" >> $log
+echo \"ENV BACKEND_INTERNAL_URL=\$BACKEND_INTERNAL_URL\" >> $log
+echo \"ENV BACKEND_BROWSER_URL=\$BACKEND_BROWSER_URL\" >> $log
 if [ -f \"$VENV_ACT\" ]; then
   source \"$VENV_ACT\"
   echo \"VENV OK: \$VIRTUAL_ENV\" >> $log
@@ -145,8 +149,8 @@ try:
   print(\"vLLM:\", getattr(vllm, \"__version__\", \"unknown\"))
   print(\"torch:\", torch.__version__)
   print(\"transformers:\", transformers.__version__)
-  print(\"torch.cuda.device_count:\", __import__(\"torch\").cuda.device_count())
   import torch as _t
+  print(\"torch.cuda.device_count:\", _t.cuda.device_count())
   print(\"torch.cuda.get_device_name(0):\", _t.cuda.get_device_name(0) if _t.cuda.is_available() and _t.cuda.device_count()>0 else \"N/A\")
 except Exception as e:
   print(\"[precheck] import error:\", e)
@@ -165,7 +169,6 @@ PY
 echo "🧠 Iniciando GPT-OSS-20B (vLLM) en GPU $GPU_ID…"
 GPT_LOG="$LOGDIR/gptoss20b.log"
 : > "$GPT_LOG"
-# NOTA: no usar comillas simples en $body; usa dobles y escapa \$ cuando corresponda
 GPT_BODY="
 cd $HOME_DIR/multimodal_graph
 printf \"[gptoss20b] CWD: %s\n\" \$(pwd)
@@ -176,36 +179,12 @@ python -m vllm.entrypoints.openai.api_server \
   --served-model-name gpt-oss-20b \
   --tensor-parallel-size 1 \
   --max-model-len 32000 \
-  --gpu-memory-utilization 0.35 \
+  --gpu-memory-utilization 0.9 \
   --no-enable-prefix-caching \
   --enforce-eager
 "
 launch_tmux_script "gptoss20b" "$GPT_LOG" "$GPT_BODY"
 wait_http_ready "GPT-OSS-20B" "http://127.0.0.1:8010/v1/models" "gptoss20b" "$GPT_LOG" 900
-
-# 4.2 LLaVA-1.5-7B (Visión) con vLLM (OpenAI server)
-echo "🎨 Iniciando LLaVA-1.5-7B en GPU $GPU_ID…"
-LLAVA_LOG="$LOGDIR/llava.log"
-: > "$LLAVA_LOG"
-LLAVA_BODY="
-cd $HOME_DIR/multimodal_graph
-printf \"[llava] CWD: %s\n\" \$(pwd)
-printf \"[llava] ENV CUDA_VISIBLE_DEVICES=%s\n\" \$CUDA_VISIBLE_DEVICES
-python -m vllm.entrypoints.openai.api_server \
-  --model \"$LLAVA_DIR\" \
-  --host 0.0.0.0 --port 8001 \
-  --served-model-name llava-1.5-7b-hf \
-  --dtype bfloat16 \
-  --tensor-parallel-size 1 \
-  --max-model-len 4096 \
-  --gpu-memory-utilization 0.10 \
-  --cpu-offload-gb 32 \
-  --trust-remote-code \
-  --disable-log-stats \
-  --enforce-eager
-"
-launch_tmux_script "llava" "$LLAVA_LOG" "$LLAVA_BODY"
-wait_http_ready "LLaVA-1.5-7B" "http://127.0.0.1:8001/v1/models" "llava" "$LLAVA_LOG" 600
 
 # 4.3 Backend FastAPI
 echo "🧩 Iniciando Backend FastAPI…"
@@ -230,15 +209,15 @@ echo "✅ Frontend lanzado (puerto 8502)."
 # -----------------------------
 # 5) Resumen
 # -----------------------------
-echo
 echo "----------------------------------------------------"
 echo "✅ Stack completo levantado en GPU FÍSICA $GPU_ID"
 echo "   🧠 GPT-OSS-20B ➜ http://localhost:8010/v1"
-echo "   🎨 LLaVA-1.5-7B ➜ http://localhost:8001/v1"
 echo "   🧩 Backend      ➜ http://localhost:8083"
 echo "   🌐 Frontend     ➜ http://localhost:8502"
 echo
+echo "🌐 BACKEND_INTERNAL_URL = $BACKEND_INTERNAL_URL"
+echo "🌐 BACKEND_BROWSER_URL  = $BACKEND_BROWSER_URL"
+echo
 echo "🔎 Ver GPU:  nvidia-smi -i $GPU_ID"
 echo "🧪 Probar:   curl -s http://127.0.0.1:8010/v1/models | head"
-echo "👉 Parar:    bash /home/gperalta/MemorIAnet/stop_app.sh"
 echo "----------------------------------------------------"
