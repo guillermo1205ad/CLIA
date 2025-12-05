@@ -11,6 +11,15 @@ interface Message {
   image?: string | null; // data URL para preview en el chat
 }
 
+/** Chunk que viene desde el backend en explanation.chunks */
+interface ChunkSource {
+  id: string;
+  text: string;
+  source_name?: string;
+  source_url?: string | null;
+  viewer_url?: string | null;
+}
+
 /** URLs de backend desde variables Vite (o fallback local) */
 
 const BACKEND_INTERNAL_URL: string =
@@ -194,6 +203,15 @@ const MarkdownBlock: React.FC<{ text: string }> = ({ text }) => {
   return <>{elements}</>;
 };
 
+/** Construye URL de descarga al backend para un archivo */
+function buildDownloadUrl(sourceName?: string): string | null {
+  if (!sourceName) return null;
+  // usamos mount_id = 0 como en el backend
+  return `${BACKEND_INTERNAL_URL}/download/0/${encodeURIComponent(
+    sourceName
+  )}`;
+}
+
 function App() {
   const [backendOk, setBackendOk] = useState<boolean>(false);
   const [backendStatusText, setBackendStatusText] = useState<string>(
@@ -212,7 +230,9 @@ function App() {
   const [input, setInput] = useState<string>("");
   const [isLoading, setIsLoading] = useState<boolean>(false);
 
-  const [refs, setRefs] = useState<string[]>([]);
+  // Ahora refs guarda los CHUNKS usados en la última respuesta
+  const [refs, setRefs] = useState<ChunkSource[]>([]);
+
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
 
@@ -337,9 +357,25 @@ function App() {
       const data = await response.json();
       const rawAnswer = (data?.answer || "").trim();
       const explanation = data?.explanation || {};
-      const docs: string[] = explanation?.documents || [];
 
-      setRefs(Array.isArray(docs) ? docs : []);
+      // NUEVO: recogemos explanation.chunks para el panel de fuentes
+      const rawChunks: any[] = Array.isArray(explanation?.chunks)
+        ? (explanation.chunks as any[])
+        : [];
+      const chunks: ChunkSource[] = rawChunks.map((ch, idx) => ({
+        id: String(ch.id ?? idx),
+        text: String(ch.text ?? ""),
+        source_name:
+          ch.source_name ??
+          ch.source_name ??
+          ch.doc_name ??
+          ch.source ??
+          undefined,
+        source_url: ch.source_url ?? null,
+        viewer_url: ch.viewer_url ?? null,
+      }));
+
+      setRefs(chunks);
 
       const answer =
         rawAnswer ||
@@ -471,11 +507,11 @@ function App() {
         </div>
       </div>
 
-      {/* GRID PRINCIPAL */}
+      {/* GRID PRINCIPAL: MITAD / MITAD */}
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "minmax(260px, 320px) minmax(0, 1fr)",
+          gridTemplateColumns: "repeat(2, minmax(0, 1fr))", // 50/50
           gap: "1.5rem",
           height: "calc(100vh - 70px)",
         }}
@@ -501,7 +537,8 @@ function App() {
               marginBottom: 10,
             }}
           >
-            (En esta versión mínima aún no mostramos referencias directas.)
+            Chunks utilizados en la última respuesta. Puedes descargar el
+            archivo asociado.
           </div>
 
           <div
@@ -523,43 +560,87 @@ function App() {
                 No hay fuentes asociadas a la última respuesta.
               </div>
             ) : (
-              <ul
+              <div
                 style={{
-                  listStyle: "none",
-                  padding: 0,
-                  margin: 0,
                   display: "flex",
                   flexDirection: "column",
-                  gap: 4,
+                  gap: 8,
                 }}
               >
-                {refs.slice(0, 30).map((name, idx) => (
-                  <li
-                    key={`${idx}-${name}`}
-                    style={{
-                      padding: "6px 8px",
-                      borderRadius: 8,
-                      backgroundColor: "rgba(15,23,42,0.8)",
-                      border: "1px solid rgba(51,65,85,0.8)",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={name}
-                  >
-                    <span
+                {refs.map((chunk, idx) => {
+                  const downloadUrl = buildDownloadUrl(chunk.source_name);
+                  return (
+                    <article
+                      key={`${chunk.id}-${idx}`}
                       style={{
-                        color: "#9ca3af",
-                        marginRight: 6,
-                        fontSize: 11,
+                        padding: "0.5rem 0.6rem",
+                        borderRadius: 10,
+                        backgroundColor: "rgba(15,23,42,0.9)",
+                        border: "1px solid rgba(51,65,85,0.9)",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 4,
                       }}
                     >
-                      [{idx + 1}]
-                    </span>
-                    {name}
-                  </li>
-                ))}
-              </ul>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontSize: 11,
+                            fontWeight: 600,
+                            color: "#e5e7eb",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={chunk.source_name || undefined}
+                        >
+                          [{idx + 1}]{" "}
+                          {chunk.source_name || "Fragmento sin archivo"}
+                        </div>
+                        {downloadUrl && (
+                          <a
+                            href={downloadUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            style={{
+                              fontSize: 11,
+                              borderRadius: 999,
+                              padding: "3px 8px",
+                              backgroundColor: "#020617",
+                              border: "1px solid #4b5563",
+                              color: "#e5e7eb",
+                              textDecoration: "none",
+                              flexShrink: 0,
+                            }}
+                          >
+                            Descargar
+                          </a>
+                        )}
+                      </div>
+
+                      <div
+                        style={{
+                          fontSize: 12,
+                          color: "#d1d5db",
+                          maxHeight: 120,
+                          overflowY: "auto",
+                          whiteSpace: "pre-wrap",
+                          marginTop: 2,
+                        }}
+                      >
+                        {chunk.text}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
             )}
           </div>
         </div>
