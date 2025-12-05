@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Backend de CLIA 🇨🇱
+Backend de Nuestra-MemorIA 🇨🇱 / MemorIAnet
 
-- RAGAnything + LightRAG con el mismo storage (mode="mix")
+- RAG-Anything + LightRAG con el mismo storage (mode="mix")
+- LLM local vía API OpenAI-compatible (gpt-oss-20b)
 - Reranker local: mixedbread-ai/mxbai-rerank-large-v2
-- Explicabilidad con enlaces PDF.js y control de archivos privados
-- Endpoint robusto /download con búsqueda flexible
+- Explicabilidad:
+    * Chunks de contexto (para UI tipo NotebookLM)
+    * Enlaces a PDF.js con #search basado en el chunk
+    * Control de documentos privados (prefijo "priv.")
+- Descarga robusta:
+    * /download/{mount_id}/{filename}  (búsqueda borrosa sobre DOCS_PATHS)
+    * /download_path?path=/ruta/absoluta/permitida (para imágenes, etc.)
 """
 
 import os
@@ -42,24 +48,30 @@ TEXT_MODEL = "gpt-oss-20b"
 BASE_URL_TEXT = "http://localhost:8010/v1"
 API_KEY_TEXT = "none"
 
-STORAGE_PATH = os.environ.get("STORAGE_PATH", "path")
-RERANK_MODEL_PATH = os.environ.get("RERANK_MODEL_PATH", "path")
+STORAGE_PATH = os.environ.get(
+    "STORAGE_PATH", "/home/gperalta/datos_grafo/rag_storage"
+)
+RERANK_MODEL_PATH = os.environ.get(
+    "RERANK_MODEL_PATH", "/home/gperalta/models/mxbai-rerank-large-v2"
+)
 
 ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "0").lower() in ("1", "true", "yes")
 
 DOCS_PATHS = [
-    "path",
+    "/home/gperalta/datos_grafo/docs",
 ]
 DOCS_MOUNTS = [f"/files/{i}" for i in range(len(DOCS_PATHS))]
 PDFJS_VIEWER = "https://mozilla.github.io/pdf.js/web/viewer.html"
+
+OUTPUT_RAG_PATH = "/home/gperalta/datos_grafo/output_rag"
 
 rag_instance = None
 reranker_tokenizer = None
 reranker_model = None
 
-app = FastAPI(title="CLIA Backend", version="3.2")
+app = FastAPI(title="Nuestra-MemorIA Backend", version="3.5")
 
-# Monta documentos estáticos
+# Monta documentos estáticos (para PDF.js / descargas directas)
 for base, mount in zip(DOCS_PATHS, DOCS_MOUNTS):
     p = Path(base)
     p.mkdir(parents=True, exist_ok=True)
@@ -73,6 +85,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ─────────────────────────────────────────────
 # LLM + EMBEDDINGS
@@ -88,6 +101,7 @@ def build_llm_func():
             base_url=BASE_URL_TEXT,
             **kwargs,
         )
+
     return llm_model_func
 
 
@@ -106,9 +120,11 @@ def build_embedding_func():
                 convert_to_numpy=True,
             )
             return vecs.tolist()
+
         return await asyncio.to_thread(_encode)
 
     return EmbeddingFunc(embedding_dim=1024, max_token_size=8192, func=_embed_async)
+
 
 # ─────────────────────────────────────────────
 # RERANKER
@@ -119,6 +135,7 @@ def ensure_reranker_loaded():
         return
     if reranker_model is not None:
         return
+
     print(f"[Rerank] Cargando modelo: {RERANK_MODEL_PATH}")
     reranker_tokenizer = AutoTokenizer.from_pretrained(RERANK_MODEL_PATH)
     reranker_model = AutoModelForSequenceClassification.from_pretrained(
@@ -135,18 +152,24 @@ def rerank_chunks(question: str, chunks: list[dict], top_k: int = 100) -> list[d
         return []
     if not ENABLE_RERANK:
         return chunks[:top_k]
+
     ensure_reranker_loaded()
     texts = [c.get("text", "") for c in chunks]
     q_list = [question] * len(texts)
+
     with torch.no_grad():
-        enc = reranker_tokenizer(q_list, texts, padding=True, truncation=True, return_tensors="pt")
+        enc = reranker_tokenizer(
+            q_list, texts, padding=True, truncation=True, return_tensors="pt"
+        )
         if torch.cuda.is_available():
             enc = {k: v.cuda() for k, v in enc.items()}
         logits = reranker_model(**enc).logits
         probs = F.softmax(logits, dim=-1)
         scores = probs[:, 1].detach().cpu().tolist()
+
     ranked = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)
     return [c for c, _ in ranked[:top_k]]
+
 
 # ─────────────────────────────────────────────
 # RAGAnything INIT
@@ -173,6 +196,7 @@ async def get_rag():
         print(f"✅ RAG listo en {STORAGE_PATH}")
     return rag_instance
 
+
 # ─────────────────────────────────────────────
 # UTILIDADES
 # ─────────────────────────────────────────────
@@ -181,6 +205,7 @@ def is_private(path_str: str) -> bool:
         return Path(path_str).name.startswith("priv.")
     except Exception:
         return True
+
 
 def public_file_url(abs_path: str) -> str | None:
     p = Path(abs_path)
@@ -195,9 +220,11 @@ def public_file_url(abs_path: str) -> str | None:
             continue
     return None
 
+
 def search_terms_from_text(text: str, max_terms: int = 6) -> str:
     words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]{4,}", text)[:max_terms]
     return " ".join(words)
+
 
 def try_extract_context(rag) -> dict:
     lr = getattr(rag, "lightrag", None)
@@ -209,27 +236,101 @@ def try_extract_context(rag) -> dict:
             return ctx
     return {}
 
+
+async def fetch_context_from_lightrag(rag, question: str, top_k: int = 80) -> dict:
+    lr = getattr(rag, "lightrag", None)
+    if lr is None:
+        return {"chunks": [], "relations": []}
+
+    chunks_vdb = getattr(lr, "chunks_vdb", None)
+    text_chunks_db = getattr(lr, "text_chunks", None)
+
+    if chunks_vdb is None or text_chunks_db is None:
+        print("[debug-context] LightRAG no expone chunks_vdb/text_chunks")
+        return {"chunks": [], "relations": []}
+
+    try:
+        results = await chunks_vdb.query(question, top_k=top_k)
+    except Exception as e:
+        print(f"[debug-context] Error en chunks_vdb.query: {e}")
+        return {"chunks": [], "relations": []}
+
+    if not results:
+        return {"chunks": [], "relations": []}
+
+    chunk_ids = [r.get("id") for r in results if r.get("id")]
+    if not chunk_ids:
+        return {"chunks": [], "relations": []}
+
+    try:
+        raw_chunks = await text_chunks_db.get_by_ids(chunk_ids)
+    except Exception as e:
+        print(f"[debug-context] Error en text_chunks.get_by_ids: {e}")
+        return {"chunks": [], "relations": []}
+
+    cleaned_chunks: list[dict] = []
+    for r, ch in zip(results, raw_chunks):
+        if not ch:
+            continue
+        text = ch.get("content") or ch.get("text") or ""
+        if not text.strip():
+            continue
+
+        src = (
+            ch.get("source")
+            or ch.get("file_path")
+            or ch.get("path")
+            or ch.get("doc_path")
+            or ch.get("doc")
+            or ""
+        )
+        meta = ch.get("meta") or {}
+        if isinstance(meta, dict):
+            src = meta.get("source", src)
+            doc_name = meta.get("doc_name") or meta.get("document_name") or ""
+        else:
+            doc_name = ""
+
+        cleaned_chunks.append(
+            {
+                "id": r.get("id"),
+                "text": text,
+                "source": src,
+                "doc_name": doc_name,
+            }
+        )
+
+    return {"chunks": cleaned_chunks, "relations": []}
+
+
 def enrich_chunks_for_ui(question: str, chunks: list[dict]) -> list[dict]:
-    out = []
+    out: list[dict] = []
     for i, ch in enumerate(chunks, 1):
         text = ch.get("text", "") or ch.get("content", "")
         src = ch.get("source") or ch.get("file_path") or ch.get("path") or ""
         source_url, viewer_url = None, None
+
         if src and not is_private(src):
             murl = public_file_url(src)
             if murl:
                 source_url = f"http://localhost:8083{murl}"
                 if str(src).lower().endswith(".pdf"):
                     terms = search_terms_from_text(text)
-                    viewer_url = f"{PDFJS_VIEWER}?file={quote(source_url)}#search={quote(terms)}"
-        out.append({
-            "id": f"C{i}",
-            "text": text,
-            "source_name": Path(src).name if src else "",
-            "source_url": source_url,
-            "viewer_url": viewer_url,
-        })
+                    viewer_url = (
+                        f"{PDFJS_VIEWER}?file={quote(source_url)}#search={quote(terms)}"
+                    )
+
+        out.append(
+            {
+                "id": f"C{i}",
+                "text": text,
+                "source_name": Path(src).name if src else (ch.get("doc_name") or ""),
+                "source_url": source_url,
+                "viewer_url": viewer_url,
+            }
+        )
     return out
+
 
 # ─────────────────────────────────────────────
 # ENDPOINTS PRINCIPALES
@@ -244,31 +345,67 @@ async def health():
         "rerank_enabled": ENABLE_RERANK,
     }
 
+
 @app.post("/query/text")
 async def query_text(question: str = Form(...)):
     try:
         rag = await get_rag()
         print(f"🔎 Q: {question}")
+
         answer = await rag.aquery(question, mode="mix")
 
-        ctx = try_extract_context(rag)
-        raw_chunks = ctx.get("chunks") or ctx.get("naive_context") or []
+        ctx = await fetch_context_from_lightrag(rag, question, top_k=200)
+
+        if not ctx.get("chunks"):
+            internal = try_extract_context(rag)
+            ctx = {
+                "chunks": internal.get("chunks") or internal.get("naive_context") or [],
+                "relations": internal.get("relations") or [],
+            }
+
+        raw_chunks = ctx.get("chunks") or []
         relations = ctx.get("relations") or []
 
-        visible = [c for c in raw_chunks if not is_private(c.get("source", ""))]
+        if not raw_chunks:
+            print("[debug-context] No se pudo obtener contexto; devolviendo dummy.")
+            raw_chunks = [
+                {
+                    "text": "[debug-context] No se recibió contexto de LightRAG.",
+                    "source": "",
+                }
+            ]
+
+        visible = [c for c in raw_chunks if not is_private(str(c.get("source", "")))]
+        if not visible:
+            visible = raw_chunks
+
         top_chunks = rerank_chunks(question, visible, 200)
         enriched = enrich_chunks_for_ui(question, top_chunks)
-        documents = sorted({Path(e["source_name"]).name for e in enriched if e["source_name"]})
+        documents = sorted(
+            {
+                Path(e["source_name"]).name
+                for e in enriched
+                if e.get("source_name")
+            }
+        )
 
-        explanation = {"chunks": enriched, "relations": relations, "documents": documents}
+        explanation = {
+            "chunks": enriched,
+            "relations": relations,
+            "documents": documents,
+        }
         return JSONResponse({"answer": answer, "explanation": explanation})
     except Exception as e:
         print(f"❌ /query/text: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 @app.post("/query/multimodal")
-async def query_multimodal(question: str = Form(...), image: UploadFile | None = None):
+async def query_multimodal(
+    question: str = Form(...), image: UploadFile | None = None
+):
     return await query_text(question)
+
 
 @app.get("/graph/data")
 async def graph_data():
@@ -279,6 +416,7 @@ async def graph_data():
     except Exception as e:
         print(f"⚠️ /graph/data: {e}")
         return JSONResponse({"nodes": [], "links": []})
+
 
 @app.get("/doc/view/{mount_id}/{path:path}")
 async def doc_view(mount_id: int, path: str, q: str = ""):
@@ -293,6 +431,7 @@ async def doc_view(mount_id: int, path: str, q: str = ""):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 # ─────────────────────────────────────────────
 # DESCARGA ROBUSTA
 # ─────────────────────────────────────────────
@@ -303,12 +442,15 @@ def _norm(s: str) -> str:
     s = re.sub(r"[^a-z0-9_.]+", "_", s)
     return s
 
+
 def _best_match_file(mount_id: int, filename: str) -> Path | None:
     base = Path(DOCS_PATHS[mount_id]).resolve()
     if not base.exists():
         return None
     target = _norm(filename)
-    best, best_score = None, 0.0
+    best = None
+    best_score = 0.0
+
     for p in base.rglob("*"):
         if not p.is_file() or p.name.startswith("priv."):
             continue
@@ -319,26 +461,80 @@ def _best_match_file(mount_id: int, filename: str) -> Path | None:
             break
     return best if best_score > 0.6 else None
 
+
 @app.get("/download/{mount_id}/{filename:path}")
 async def download_file(mount_id: int, filename: str):
     try:
         if Path(filename).name.startswith("priv."):
             return JSONResponse({"error": "Documento privado"}, status_code=403)
+
         found = _best_match_file(mount_id, filename)
         if not found:
-            return JSONResponse({"error": f"No encontrado: {filename}"}, status_code=404)
-        mime = "application/pdf" if found.suffix.lower() == ".pdf" else "application/octet-stream"
-        print(f"⬇️ Descarga: {found.name} (match ok)")
+            return JSONResponse(
+                {"error": f"No encontrado: {filename}"}, status_code=404
+            )
+
+        ext = found.suffix.lower()
+        if ext == ".pdf":
+            mime = "application/pdf"
+        elif ext in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        elif ext == ".png":
+            mime = "image/png"
+        else:
+            mime = "application/octet-stream"
+
+        print(f"⬇️ Descarga: {found} (match ok)")
         return FileResponse(str(found), media_type=mime, filename=found.name)
     except Exception as e:
+        print(f"❌ /download error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/download_path")
+async def download_path(path: str):
+    """
+    Descarga un archivo por ruta absoluta, restringida a DOCS_PATHS y OUTPUT_RAG_PATH.
+    Útil para imágenes mencionadas en los chunks.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+
+        allowed_raw_bases = list(DOCS_PATHS) + [OUTPUT_RAG_PATH]
+        allowed_bases = [Path(b).resolve() for b in allowed_raw_bases]
+
+        if not any(str(p).startswith(str(b)) for b in allowed_bases):
+            print(f"[download_path] Ruta no permitida: {p}")
+            return JSONResponse({"error": "Ruta no permitida"}, status_code=403)
+
+        if not p.is_file():
+            print(f"[download_path] No existe: {p}")
+            return JSONResponse({"error": f"No existe: {p}"}, status_code=404)
+
+        ext = p.suffix.lower()
+        if ext in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        elif ext == ".png":
+            mime = "image/png"
+        elif ext == ".pdf":
+            mime = "application/pdf"
+        else:
+            mime = "application/octet-stream"
+
+        print(f"⬇️ /download_path {p}")
+        return FileResponse(str(p), media_type=mime, filename=p.name)
+    except Exception as e:
+        print(f"❌ /download_path error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Backend CLIA activo en http://0.0.0.0:8083")
+
+    print("🚀 Backend MemorIAnet activo en http://0.0.0.0:8083")
     if ENABLE_RERANK:
         try:
             ensure_reranker_loaded()

@@ -1,13 +1,11 @@
 #!/bin/bash
 # ===================================================================
-# 🚀 Stack Nuestra-MemorIA en GPU específica (ÍNDICE + venv + tmux)
+# 🚀 Stack CLIA en GPU específica (ÍNDICE + venv + tmux)
 #    - GPU por índice (CUDA_DEVICE_ORDER=PCI_BUS_ID)
 #    - venv: ~/multimodal_graph/multimodal_graph_env
 #    - vLLM vía "python -m ..." (sin depender del binario)
-#    - Autodetección de rutas de modelos
-#    - Espera con timeout y tail de logs si falla
-#    - Diagnóstico detallado dentro de cada sesión tmux
-#    - HF offline para evitar tratar rutas locales como repos
+#    - Backend FastAPI: ~/CLIA/backend/main.py
+#    - Frontend React (Vite): ~/CLIA/frontend-react
 # ===================================================================
 set -euo pipefail
 
@@ -22,11 +20,11 @@ HOME_DIR="$HOME"
 LOGDIR="$HOME_DIR/logs_memoria"
 mkdir -p "$LOGDIR"
 
-APP_BACKEND_DIR="$HOME_DIR/path"
-APP_FRONTEND_DIR="$HOME_DIR/path"
+APP_BACKEND_DIR="$HOME_DIR/CLIA/backend"
+APP_FRONTEND_DIR="$HOME_DIR/CLIA/frontend-react"
 
-# venv
-VENV_DIR="$HOME_DIR/path"
+# venv (el mismo que usas para todo el grafo)
+VENV_DIR="$HOME_DIR/multimodal_graph/multimodal_graph_env"
 VENV_ACT="$VENV_DIR/bin/activate"
 if [ ! -f "$VENV_ACT" ]; then
   echo "❌ No existe el venv en: $VENV_ACT"
@@ -34,35 +32,31 @@ if [ ! -f "$VENV_ACT" ]; then
 fi
 VENV_PY="$VENV_DIR/bin/python"
 
-# Model roots candidatos (ajusta/añade si hiciera falta)
+# Model roots candidatos
 MODEL_ROOTS=(
-  "$HOME_DIR/path"
-  "$HOME_DIR/path"
-  "path"
+  "$HOME_DIR/models"
+  "$HOME_DIR/multimodal_graph/models"
+  "/home/gperalta/models"
 )
 
-# Nombres esperados
 GPT20B_NAME="gpt-oss-20b"
 
 # -----------------------------
 # 1) Entorno GPU + Offline HF
 # -----------------------------
-export CUDA_DEVICE_ORDER=PCI_BUS_ID          # índice estable
-export CUDA_VISIBLE_DEVICES="$GPU_ID"        # expón SOLO la GPU deseada
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES="$GPU_ID"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-# 🔗 URLs backend (las heredan backend y frontend vía tmux)
-# - BACKEND_INTERNAL_URL: cómo el frontend (Streamlit en el servidor) llama al backend
-# - BACKEND_BROWSER_URL: cómo el navegador del usuario ve el backend (dominio público)
-# - BACKEND_URL: valor por defecto que usa app.py si no se definen las otras
-export BACKEND_INTERNAL_URL="http://localhost:8083"                             # Streamlit → backend
-export BACKEND_BROWSER_URL="https://grafo-nuestramemoria.pln.villena.cl"        # Navegador → backend
+# URLs backend (las heredan backend y frontend)
+export BACKEND_INTERNAL_URL="http://localhost:8083"
+export BACKEND_BROWSER_URL="https://grafo-nuestramemoria.pln.villena.cl"
 export BACKEND_URL="$BACKEND_INTERNAL_URL"
 
 echo
-echo "🚀 Iniciando stack completo en GPU FÍSICA $GPU_ID…"
+echo "🚀 Iniciando stack CLIA en GPU FÍSICA $GPU_ID…"
 echo "📂 Logs: $LOGDIR"
 echo "🌐 BACKEND_INTERNAL_URL = $BACKEND_INTERNAL_URL"
 echo "🌐 BACKEND_BROWSER_URL  = $BACKEND_BROWSER_URL"
@@ -109,7 +103,7 @@ wait_http_ready () {
 }
 
 # -----------------------------
-# 3) Autodetectar rutas de modelos
+# 3) Autodetectar ruta del modelo
 # -----------------------------
 GPT20B_DIR="$(pick_model_dir "$GPT20B_NAME" "${MODEL_ROOTS[@]}")" || {
   echo "❌ No encuentro el modelo $GPT20B_NAME en: ${MODEL_ROOTS[*]}"
@@ -118,14 +112,12 @@ GPT20B_DIR="$(pick_model_dir "$GPT20B_NAME" "${MODEL_ROOTS[@]}")" || {
 }
 
 # -----------------------------
-# 4) Servicios (cada uno crea su propio script dentro de tmux)
+# 4) Servicios: tmux
 # -----------------------------
-
-# Helper para crear una sesión tmux que ejecuta un mini-script con venv
 launch_tmux_script () {
   local session="$1"
   local log="$2"
-  local body="$3"   # contenido del script a ejecutar dentro de la sesión
+  local body="$3"
 
   tmux new-session -d -s "$session" "bash -lc '
 set -e
@@ -143,18 +135,6 @@ else
 fi
 which python >> $log || true
 python -V   >> $log || true
-python - <<PY >> $log 2>&1 || true
-try:
-  import vllm, torch, transformers
-  print(\"vLLM:\", getattr(vllm, \"__version__\", \"unknown\"))
-  print(\"torch:\", torch.__version__)
-  print(\"transformers:\", transformers.__version__)
-  import torch as _t
-  print(\"torch.cuda.device_count:\", _t.cuda.device_count())
-  print(\"torch.cuda.get_device_name(0):\", _t.cuda.get_device_name(0) if _t.cuda.is_available() and _t.cuda.device_count()>0 else \"N/A\")
-except Exception as e:
-  print(\"[precheck] import error:\", e)
-PY
 
 {
   echo \"========== [$session] launching ==========\"
@@ -165,7 +145,7 @@ PY
   echo "✅ Sesión $session lanzada."
 }
 
-# 4.1 GPT-OSS-20B (Texto) con vLLM (OpenAI server)
+# 4.1 GPT-OSS-20B (vLLM)
 echo "🧠 Iniciando GPT-OSS-20B (vLLM) en GPU $GPU_ID…"
 GPT_LOG="$LOGDIR/gptoss20b.log"
 : > "$GPT_LOG"
@@ -186,31 +166,35 @@ python -m vllm.entrypoints.openai.api_server \
 launch_tmux_script "gptoss20b" "$GPT_LOG" "$GPT_BODY"
 wait_http_ready "GPT-OSS-20B" "http://127.0.0.1:8010/v1/models" "gptoss20b" "$GPT_LOG" 900
 
-# 4.3 Backend FastAPI
+# 4.2 Backend FastAPI
 echo "🧩 Iniciando Backend FastAPI…"
-BACKEND_LOG="$LOGDIR/backend.log"
+BACKEND_LOG="$LOGDIR/clia_backend.log"
 BACKEND_BODY="
 cd $APP_BACKEND_DIR
 python3 main.py
 "
-launch_tmux_script "memoria_backend" "$BACKEND_LOG" "$BACKEND_BODY"
+launch_tmux_script "clia_backend" "$BACKEND_LOG" "$BACKEND_BODY"
 echo "✅ Backend lanzado (puerto 8083)."
 
-# 4.4 Frontend Streamlit
-echo "🌐 Iniciando Frontend Streamlit…"
-FRONTEND_LOG="$LOGDIR/frontend.log"
+# 4.3 Frontend React (Vite)
+echo "🌐 Iniciando Frontend React…"
+FRONTEND_LOG="$LOGDIR/clia_frontend.log"
 FRONTEND_BODY="
 cd $APP_FRONTEND_DIR
-streamlit run app.py --server.port 8502 --server.address 0.0.0.0
+if [ ! -d node_modules ]; then
+  echo \"[frontend] Instalando dependencias (npm install)…\"
+  npm install
+fi
+npm run dev -- --host 0.0.0.0 --port 8502
 "
-launch_tmux_script "memoria_frontend" "$FRONTEND_LOG" "$FRONTEND_BODY"
-echo "✅ Frontend lanzado (puerto 8502)."
+launch_tmux_script "clia_frontend" "$FRONTEND_LOG" "$FRONTEND_BODY"
+echo "✅ Frontend React lanzado (puerto 8502)."
 
 # -----------------------------
 # 5) Resumen
 # -----------------------------
 echo "----------------------------------------------------"
-echo "✅ Stack completo levantado en GPU FÍSICA $GPU_ID"
+echo "✅ Stack CLIA levantado en GPU FÍSICA $GPU_ID"
 echo "   🧠 GPT-OSS-20B ➜ http://localhost:8010/v1"
 echo "   🧩 Backend      ➜ http://localhost:8083"
 echo "   🌐 Frontend     ➜ http://localhost:8502"
@@ -219,5 +203,11 @@ echo "🌐 BACKEND_INTERNAL_URL = $BACKEND_INTERNAL_URL"
 echo "🌐 BACKEND_BROWSER_URL  = $BACKEND_BROWSER_URL"
 echo
 echo "🔎 Ver GPU:  nvidia-smi -i $GPU_ID"
-echo "🧪 Probar:   curl -s http://127.0.0.1:8010/v1/models | head"
+echo "🧪 Probar LLM:         curl -s http://127.0.0.1:8010/v1/models | head"
+echo "🧪 Probar health back: curl -s http://127.0.0.1:8083/health"
+echo
+echo "💤 Para detener sesiones:"
+echo "    tmux kill-session -t gptoss20b"
+echo "    tmux kill-session -t clia_backend"
+echo "    tmux kill-session -t clia_frontend"
 echo "----------------------------------------------------"
